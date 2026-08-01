@@ -1,10 +1,12 @@
 ﻿#Requires -Version 5.1
 <#
 .SYNOPSIS
-    从安卓手机复制照片到本地目录（跳过重复）
+    从安卓手机复制照片到本地目录（跳过重复，MTP 模式）
 .DESCRIPTION
-    通过 MTP 连接安卓手机，扫描微信、相机等多个照片目录，
-    按文件大小+名称去重后复制到 C:\pic
+    通过 MTP 连接安卓手机，扫描相机、截图、微信等目录，
+    按文件名去重后复制到指定目录。
+.PARAMETER DestPath
+    保存目录，默认 C:\pic
 #>
 
 param(
@@ -28,178 +30,147 @@ function List-FolderItems {
     try {
         $f = if ($Folder.GetFolder) { $Folder.GetFolder() } elseif ($Folder.Items) { $Folder } else { return @() }
         return @($f.Items())
-    } catch { return @() }
+    } catch {
+        return @()
+    }
 }
 
 function Copy-FileViaMTP {
-    param([object]$Item, [string]$DestFile)
-    # 用 Shell.CopyHere 复制到本地临时目录再移动
+    param([object]$Item, [string]$DestFile, [string]$FileName)
     $tempDir = Join-Path $env:TEMP "mtp_$(Get-Random)"
     New-Item -ItemType Directory -Path $tempDir -Force | Out-Null
     try {
-        $shell = New-Object -ComObject Shell.Application
-        $tempFolder = $shell.Namespace($tempDir)
-        $tempFolder.CopyHere($Item, 0x14) # 0x10=yesToAll, 0x04=noProgress
-        Start-Sleep -Milliseconds 300
-        $tempFile = Join-Path $tempDir $Item.Name
-        if (Test-Path $tempFile) {
-            Move-Item -Path $tempFile -Destination $DestFile -Force
+        $sh = New-Object -ComObject Shell.Application
+        $ns = $sh.Namespace($tempDir)
+        # 0x10 = 静默模式，0x04 = 不显示进度
+        $ns.CopyHere($Item, 0x14)
+        Start-Sleep -Milliseconds 500
+        $tmp = Join-Path $tempDir $Item.Name
+        if (Test-Path $tmp) {
+            Move-Item -Path $tmp -Destination $DestFile -Force
             return $true
         }
+        return $false
+    } catch {
         return $false
     } finally {
         if (Test-Path $tempDir) { Remove-Item -Path $tempDir -Recurse -Force -ErrorAction SilentlyContinue }
     }
 }
 
-function Copy-PhotosFromFolder {
+function Copy-Photos-MTP-Folder {
     param(
-        [object]$Folder,
-        [string]$RelPath,
-        [hashtable]$CopiedFiles,
-        [string]$DestBase,
-        [ref]$CopiedCount,
-        [ref]$SkippedCount,
-        [ref]$ErrorCount,
-        [int]$Depth = 0
+        [object]$Folder, [string]$RelPath, [hashtable]$Copied,
+        [string]$DestBase, [ref]$CopiedCount, [ref]$SkippedCount, [ref]$ErrorCount, [int]$Depth = 0
     )
     if ($Depth -gt 5) { return }
     $exts = @('.jpg','.jpeg','.png','.gif','.bmp','.webp','.heic','.heif')
 
+    Write-Host "  [扫描] $RelPath" -ForegroundColor DarkGray
     $items = List-FolderItems -Folder $Folder
+
     foreach ($item in $items) {
-        if (-not $item.IsFolder) {
+        if ($item.IsFolder) {
+            Copy-Photos-MTP-Folder -Folder $item -RelPath "$RelPath\$($item.Name)" `
+                -Copied $Copied -DestBase $DestBase `
+                -CopiedCount $CopiedCount -SkippedCount $SkippedCount -ErrorCount $ErrorCount -Depth ($Depth + 1)
+        } else {
             $ext = [System.IO.Path]::GetExtension($item.Name).ToLower()
             if ($exts -notcontains $ext) { continue }
-            $key = "$($item.Size)_$($item.Name)"
-            if ($CopiedFiles.ContainsKey($key)) { $SkippedCount.Value++; continue }
+
+            $name = $item.Name
+
+            # 跳过已复制的（进程内缓存）
+            if ($Copied.ContainsKey($name)) { $SkippedCount.Value++; continue }
 
             $destDir = Join-Path $DestBase $RelPath
-            if (-not (Test-Path $destDir)) { New-Item -ItemType Directory -Path $destDir -Force | Out-Null }
+            $destFile = Join-Path $destDir $name
 
-            $destFile = Join-Path $destDir $item.Name
-            $i = 1
-            while (Test-Path $destFile) {
-                $base = [System.IO.Path]::GetFileNameWithoutExtension($item.Name)
-                $destFile = Join-Path $destDir "${base}_${i}${ext}"; $i++
+            # 跳过已存在的（文件系统检查）
+            if (Test-Path -LiteralPath $destFile) {
+                $Copied[$name] = $destFile
+                $SkippedCount.Value++
+                continue
             }
 
-            if (Copy-FileViaMTP -Item $item -DestFile $destFile) {
-                $CopiedFiles[$key] = $destFile
+            if (-not (Test-Path -LiteralPath $destDir)) { New-Item -ItemType Directory -Path $destDir -Force | Out-Null }
+
+            Write-Host "    [$($CopiedCount.Value + 1)] [复制] $name" -ForegroundColor Green
+            if (Copy-FileViaMTP -Item $item -DestFile $destFile -FileName $name) {
+                $Copied[$name] = $destFile
                 $CopiedCount.Value++
             } else {
                 $ErrorCount.Value++
-                Write-Log "  [!] $($item.Name) - 复制失败"
+                Write-Log "  [!] $name - 复制失败"
             }
-        } else {
-            Copy-PhotosFromFolder -Folder $item -RelPath "$RelPath\$($item.Name)" `
-                -CopiedFiles $CopiedFiles -DestBase $DestBase `
-                -CopiedCount $CopiedCount -SkippedCount $SkippedCount -ErrorCount $ErrorCount `
-                -Depth ($Depth + 1)
         }
     }
 }
 
-function Navigate-To {
-    param([object]$Root, [string]$Path)
-    $parts = $Path -split '\\' | Where-Object { $_ }
-    $cur = $Root
-    foreach ($p in $parts) {
-        $next = $null
-        foreach ($s in (List-FolderItems -Folder $cur)) {
-            if ($s.IsFolder -and $s.Name -eq $p) { $next = $s; break }
+function Nav-MTP($root, $path) {
+    $p = $path -split '\\' | Where-Object { $_ }
+    $c = $root
+    foreach ($x in $p) {
+        $n = $null
+        foreach ($s in (List-FolderItems -Folder $c)) {
+            if ($s.IsFolder -and $s.Name -eq $x) { $n = $s; break }
         }
-        if (-not $next) { return $null }
-        $cur = $next
+        if (-not $n) { return $null }
+        $c = $n
     }
-    return $cur
+    return $c
 }
 
 # ── 主逻辑 ────────────────────────────────────────────────
 Write-Host "`n========================================" -ForegroundColor Yellow
-Write-Host "  安卓手机照片复制工具" -ForegroundColor Yellow
+Write-Host "  安卓手机照片复制工具 (MTP模式)" -ForegroundColor Yellow
 Write-Host "========================================`n" -ForegroundColor Yellow
 
 if (-not (Test-Path $DestPath)) { New-Item -ItemType Directory -Path $DestPath -Force | Out-Null }
 if (Test-Path $LogPath) { Remove-Item $LogPath -Force }
 
-$shell     = New-Object -ComObject Shell.Application
-$namespace = $shell.Namespace(0x11)
+# 加载已有文件到去重表
+$copiedFiles = @{}
+if (Test-Path $DestPath) {
+    Get-ChildItem -Path $DestPath -Recurse -File | ForEach-Object {
+        $copiedFiles[$_.Name] = $_.FullName
+    }
+}
+Write-Log "目标目录已有 $($copiedFiles.Count) 个文件"
 
-# 找到 MTP 设备
+# 扫描 MTP 设备
+$shell = New-Object -ComObject Shell.Application
+$ns = $shell.Namespace(0x11)
+
 Write-Host "正在扫描此电脑..." -ForegroundColor Yellow
-$devices = @()
-foreach ($item in $namespace.Items()) {
-    Write-Host "  发现: $($item.Name) (类型: $($item.Type))" -ForegroundColor Gray
-    $devices += $item
-}
-
-if ($devices.Count -eq 0) {
-    Write-Host "`n[错误] 未检测到设备！" -ForegroundColor Red; exit 1
-}
+$devices = @($ns.Items())
+if ($devices.Count -eq 0) { Write-Host "[错误] 未检测到设备！" -ForegroundColor Red; exit }
 
 $totalCopied = 0; $totalSkipped = 0; $totalErrors = 0
-$copiedFiles = @{}
 
 foreach ($device in $devices) {
     Write-Host "`n设备: $($device.Name)" -ForegroundColor Green
-    Write-Log "设备: $($device.Name)"
 
     # 查找内部存储
     $storage = $null
     foreach ($sub in (List-FolderItems -Folder $device)) {
-        if ($sub.IsFolder) {
-            if ($sub.Name -match "内部|Internal|Phone|手机|存储|Storage|shared|sdcard") {
-                $storage = $sub; break
-            }
-        }
+        if ($sub.IsFolder -and $sub.Name -match "内部|Internal|Phone|手机|存储|Storage|shared|sdcard") { $storage = $sub; break }
     }
     if (-not $storage) {
         $folders = @(List-FolderItems -Folder $device | Where-Object { $_.IsFolder })
         if ($folders.Count -eq 1) { $storage = $folders[0] }
-        else {
-            Write-Log "  设备内容:"
-            foreach ($f in $folders) { Write-Log "    $($f.Name)" }
-            continue
-        }
+        else { Write-Log "  跳过设备: $($device.Name)"; continue }
     }
     Write-Log "  存储: $($storage.Name)"
 
-    # 扫描相机关联目录
-    $paths = @(
-        "DCIM\Camera", "DCIM\Screenshots", "DCIM\100MEDIA"
-        "Download", "Pictures\Screenshots", "Pictures\WeChat"
-        "Download\WeChat", "Download\weixin", "Download\weixin_image"
-    )
-    foreach ($p in $paths) {
-        $d = Navigate-To -Root $storage -Path $p
+    foreach ($p in @("DCIM\Camera", "DCIM\Screenshots", "DCIM\100MEDIA", "Pictures\Screenshots", "Pictures\WeChat", "Download\WeChat")) {
+        $d = Nav-MTP $storage $p
         if ($d) {
-            Write-Log "  扫描: $p"
             $c = [ref]0; $s = [ref]0; $e = [ref]0
-            Copy-PhotosFromFolder -Folder $d -RelPath $p -CopiedFiles $copiedFiles -DestBase $DestPath `
-                -CopiedCount $c -SkippedCount $s -ErrorCount $e
+            Copy-Photos-MTP-Folder -Folder $d -RelPath $p -Copied $copiedFiles -DestBase $DestPath -CopiedCount $c -SkippedCount $s -ErrorCount $e
             $totalCopied += $c.Value; $totalSkipped += $s.Value; $totalErrors += $e.Value
         }
-    }
-
-    # 微信目录（含随机哈希）
-    foreach ($base in @("Android\data\com.tencent.mm\MicroMsg", "tencent\MicroMsg")) {
-        $wcRoot = Navigate-To -Root $storage -Path $base
-        if (-not $wcRoot) { continue }
-        foreach ($sub in (List-FolderItems -Folder $wcRoot)) {
-            if (-not $sub.IsFolder) { continue }
-            foreach ($sfx in @("camera", "Image2", "Video", "Download")) {
-                $wcDir = Navigate-To -Root $sub -Path $sfx
-                if ($wcDir) {
-                    $fullPath = "$base\$($sub.Name)\$sfx"
-                    Write-Log "  微信: $fullPath"
-                    $c = [ref]0; $s = [ref]0; $e = [ref]0
-                    Copy-PhotosFromFolder -Folder $wcDir -RelPath $fullPath -CopiedFiles $copiedFiles -DestBase $DestPath `
-                        -CopiedCount $c -SkippedCount $s -ErrorCount $e
-                    $totalCopied += $c.Value; $totalSkipped += $s.Value; $totalErrors += $e.Value
-                }
-            }
-        }
+        else { Write-Log "  跳过: $p (不存在)" }
     }
 }
 
@@ -208,3 +179,4 @@ Write-Host "  完成!" -ForegroundColor Green
 Write-Host "  已复制: $totalCopied | 跳过: $totalSkipped | 失败: $totalErrors" -ForegroundColor $(if ($totalErrors -gt 0) { "Yellow" } else { "Green" })
 Write-Host "  位置: $DestPath" -ForegroundColor Green
 Write-Host "  日志: $LogPath" -ForegroundColor Green
+Write-Host "========================================" -ForegroundColor Green
